@@ -113,6 +113,26 @@ Folder aliases: `inbox`, `sent`, `starred`, `drafts`, `spam`, `trash`,
 
 ## Installing on another machine
 
+The repo is a standard pi package, so the easiest way is `pi install`:
+
+```bash
+# from GitHub
+pi install git:github.com/breitlip/pi-gmail
+pi install https://github.com/breitlip/pi-gmail   # raw URLs work too
+
+# pin a ref (once a tag exists)
+pi install git:github.com/breitlip/pi-gmail@v1.1.0
+
+# or from a local checkout
+pi install /path/to/pi-gmail
+```
+
+`pi install` clones the repo and runs `npm install` for the runtime
+dependencies. The config file still defaults to
+`~/.pi/agent/extensions/gmail/config.json` regardless of install location.
+
+Alternatively, clone directly into pi's extension directory:
+
 ```bash
 git clone https://github.com/breitlip/pi-gmail ~/.pi/agent/extensions/gmail
 cd ~/.pi/agent/extensions/gmail && npm install

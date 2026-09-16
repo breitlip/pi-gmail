@@ -107,6 +107,12 @@ CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check` on push/PR.
   # verify: config.json still present, mode 600; git status clean
   ```
 
+  Alternative: install as a pi package with
+  `pi install git:github.com/breitlip/pi-gmail` (clones into
+  `~/.pi/agent/git/...`, runs `npm install`). The config file is unaffected
+  either way — `CONFIG_PATH` is fixed at
+  `~/.pi/agent/extensions/gmail/config.json` regardless of where the code lives.
+
 - Smoke-test that pi still loads the extension, e.g.:
 
   ```bash
