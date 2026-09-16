@@ -125,7 +125,7 @@ Then run `/gmail-auth` in pi (or set the env vars).
 ```bash
 npm run check     # lint (biome) + typecheck (tsc) + tests (node --test)
 npm test          # unit + registration + enforcement tests (no network)
-npm run test:live # additionally run live IMAP tests (needs GMAIL_LIVE=1 + credentials)
+npm run test:live # additionally run live IMAP tests (needs valid credentials)
 npm run format    # biome --write
 ```
 
@@ -133,3 +133,6 @@ The enforcement test (`test/enforcement.test.ts`) is the key one: with a temp
 config at `allowSend: false` it invokes `gmail_send`/`gmail_reply` with the
 SMTP transport factory and IMAP client factory stubbed, and asserts that **no
 SMTP transport is ever created** while the IMAP draft-append path is used.
+
+For agent-oriented notes on working on this repo (invariants, gotchas, release
+flow), see [AGENTS.md](AGENTS.md).
