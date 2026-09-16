@@ -20,6 +20,65 @@ cloud is involved; the only remote peers are Google's IMAP/SMTP servers.
    Alternative: set `GMAIL_EMAIL` and `GMAIL_APP_PASSWORD` environment
    variables (env vars take precedence over the config file).
 
+## Sending is off by default (draft-only mode)
+
+**`gmail_send` and `gmail_reply` do not send email out of the box.** With the
+default settings they compose the exact mail that would have been sent (replies
+keep their `In-Reply-To`/`References` threading headers) and save it to
+`[Gmail]/Drafts` instead. You review it and send it yourself from Gmail.
+
+This is a deliberate security default: an LLM tool that can send email can
+phish, leak, or commit you — so the safe state is "can prepare, can't send".
+
+The behavior is controlled by two settings (see below):
+
+| `allowSend` | `confirmSends` | Behavior of `gmail_send` / `gmail_reply` |
+| --- | --- | --- |
+| `false` **(default)** | any | **Never sends.** Saves a draft to `[Gmail]/Drafts`. No SMTP connection is opened. |
+| `true` | `true` **(default)** | Asks for interactive confirmation right before sending. Declining (or running headless with no UI) falls back to saving a draft. |
+| `true` | `false` | Sends without confirmation — including headless. Only use this deliberately. |
+
+Tool descriptions/prompts reflect the active mode so the LLM knows what will
+happen, and every tool result states explicitly whether the mail was sent or
+saved as a draft.
+
+### Enabling real sending
+
+Run `/gmail-config` in pi and choose **Enable sending**. This sets
+`allowSend: true` (with `confirmSends` still `true`, so each send asks for
+confirmation). To allow unattended/headless sending you must additionally
+disable send confirmation — understand that this lets pi send email with no
+human in the loop.
+
+> **Security note:** the app password in `config.json` grants full send/read
+> access to the mailbox. The file is `chmod 600` and gitignored, but treat
+> `allowSend: true` (especially with `confirmSends: false`) as giving the
+> model a live email account. Revoke app passwords any time at
+> <https://myaccount.google.com/apppasswords>.
+
+## Settings & config file
+
+The config file next to the extension (default:
+`~/.pi/agent/extensions/gmail/config.json`, overridable with
+`GMAIL_CONFIG_PATH`) holds credentials **and** settings:
+
+```json
+{
+  "email": "you@example.com",
+  "appPassword": "abcd efgh ijkl mnop",
+  "settings": { "allowSend": false, "confirmSends": true }
+}
+```
+
+- **Backward compatible:** older two-key configs (`email` + `appPassword` only)
+  keep working — missing `settings` fall back to the safe defaults
+  (`allowSend: false`, `confirmSends: true`).
+- `/gmail-auth` manages **credentials** (and preserves existing settings).
+- `/gmail-config` manages **settings** (and preserves existing credentials).
+- Both keep the file at mode **0600**.
+- `GMAIL_EMAIL` / `GMAIL_APP_PASSWORD` env overrides for credentials stay as
+  they were (env wins over the file).
+
 ## Tools
 
 | Tool | Purpose |
@@ -27,15 +86,30 @@ cloud is involved; the only remote peers are Google's IMAP/SMTP servers.
 | `gmail_folders` | List folders/labels with message + unread counts |
 | `gmail_list` | List recent emails (newest first); optional `query` full-text search, `unreadOnly` |
 | `gmail_read` | Read an email by id: headers, text body, attachment list |
-| `gmail_send` | Send a new email (to/cc/bcc, text or html) |
-| `gmail_reply` | Reply to an email by id (threads via Reply-To/Message-ID/References) |
-| `gmail_draft` | Save a draft to the Drafts folder (not sent); optionally replace an existing draft |
+| `gmail_send` | Compose a new email (to/cc/bcc, text or html) — **sends only when `allowSend` is true; otherwise saves a draft** |
+| `gmail_reply` | Reply to an email by id (threads via Reply-To/Message-ID/References) — same send guard as `gmail_send` |
+| `gmail_draft` | Save a draft to the Drafts folder (never sends); optionally replace an existing draft |
 | `gmail_mark` | Mark read/unread/starred/unstarred |
 | `gmail_move` | Move to another folder/label (e.g. `trash`, `spam`, custom label) |
 | `gmail_save_attachment` | Download an attachment to a local file (max 100 MB) |
 
 Folder aliases: `inbox`, `sent`, `starred`, `drafts`, `spam`, `trash`,
 `important`, `all` — or pass an exact label/folder name.
+
+## Commands
+
+- `/gmail-auth` — configure credentials and test the connection
+- `/gmail-status` — show account + settings and test the IMAP connection
+- `/gmail-config` — show settings and toggle `allowSend` / `confirmSends`
+  (persisted to the config file, mode 0600)
+
+## Notes
+
+- Message ids are IMAP UIDs **per folder** — always pass the `folder` the id
+  came from (gmail_list output says which mailbox it was).
+- App passwords require 2-Step Verification; revoke them anytime at the URL above.
+- Dependencies: `imapflow` (IMAP), `nodemailer` (SMTP + MIME), `mailparser`
+  (MIME parsing). Reinstall with `npm install` in this directory.
 
 ## Installing on another machine
 
@@ -46,15 +120,16 @@ cd ~/.pi/agent/extensions/gmail && npm install
 
 Then run `/gmail-auth` in pi (or set the env vars).
 
-## Commands
+## Development
 
-- `/gmail-auth` — configure credentials and test the connection
-- `/gmail-status` — show configured account and test the connection
+```bash
+npm run check     # lint (biome) + typecheck (tsc) + tests (node --test)
+npm test          # unit + registration + enforcement tests (no network)
+npm run test:live # additionally run live IMAP tests (needs GMAIL_LIVE=1 + credentials)
+npm run format    # biome --write
+```
 
-## Notes
-
-- Message ids are IMAP UIDs **per folder** — always pass the `folder` the id
-  came from (gmail_list output says which mailbox it was).
-- App passwords require 2-Step Verification; revoke them anytime at the URL above.
-- Dependencies: `imapflow` (IMAP), `nodemailer` (SMTP), `mailparser` (MIME parsing).
-  Reinstall with `npm install` in this directory.
+The enforcement test (`test/enforcement.test.ts`) is the key one: with a temp
+config at `allowSend: false` it invokes `gmail_send`/`gmail_reply` with the
+SMTP transport factory and IMAP client factory stubbed, and asserts that **no
+SMTP transport is ever created** while the IMAP draft-append path is used.
