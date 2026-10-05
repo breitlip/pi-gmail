@@ -152,7 +152,10 @@ export function makeSmtpSpy(failMode = false): SmtpSpy {
 export interface MockCtxOptions {
   hasUI?: boolean;
   confirmAnswer?: boolean;
+  /** Single answer returned by every select() call. */
   selectAnswer?: string;
+  /** Queue of answers for consecutive select() calls (shifted per call). */
+  selectAnswers?: string[];
   inputAnswers?: string[];
 }
 
@@ -169,6 +172,7 @@ export interface MockCtx {
   confirmCalls: string[];
   notifications: Array<{ message: string; type?: string }>;
   selectCalls: string[][];
+  selectQueue: string[];
   inputQueue: string[];
 }
 
@@ -190,13 +194,14 @@ export function makeCtx(options: MockCtxOptions = {}): MockCtx {
         },
         select: async (_title, optionsList) => {
           result.selectCalls.push(optionsList);
-          return options.selectAnswer;
+          return result.selectQueue.shift() ?? options.selectAnswer;
         },
       },
     },
     confirmCalls: [],
     notifications: [],
     selectCalls: [],
+    selectQueue: options.selectAnswers ?? [],
     inputQueue: options.inputAnswers ?? [],
   };
   return result;

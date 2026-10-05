@@ -26,14 +26,24 @@
  * Commands:
  *   /gmail-auth, /gmail-status, /gmail-config
  *
+ * Multi-account:
+ *   Every tool accepts an optional "account" parameter (account name or email
+ *   address). Without it, the single configured account is used, or the
+ *   defaultAccount when several are configured. Manage with /gmail-auth.
+ *
  * Config file (mode 0600, gitignored):
  *   {
- *     "email": "…",
- *     "appPassword": "…",
+ *     "defaultAccount": "support",
+ *     "accounts": {
+ *       "support": { "email": "…", "appPassword": "…" },
+ *       "pb": { "email": "…", "appPassword": "…" }
+ *     },
  *     "settings": { "allowSend": false, "confirmSends": true }
  *   }
- * Older two-key configs (email + appPassword only) keep working — missing
- * settings fall back to the safe defaults above.
+ * The legacy single-account shape ({ "email", "appPassword", "settings" })
+ * keeps working — it is treated as one account (keyed by its email address)
+ * and migrated to the multi-account shape on the next write. Missing settings
+ * fall back to the safe defaults above.
  */
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -75,9 +85,22 @@ interface Settings {
 const DEFAULT_SETTINGS: Settings = { allowSend: false, confirmSends: true };
 
 interface ConfigFile {
+  /** Multi-account (current shape). */
+  defaultAccount?: string;
+  accounts?: Record<string, { email?: string; appPassword?: string }>;
+  /** Legacy single-account shape (still readable). */
   email?: string;
   appPassword?: string;
   settings?: Partial<Settings>;
+}
+
+/** Config normalized to the multi-account shape (legacy files included). */
+interface NormalizedConfig {
+  /** Account name → credentials. */
+  accounts: Record<string, Credentials>;
+  /** Name of the account used when a tool call does not name one. */
+  defaultAccount?: string;
+  settings: Settings;
 }
 
 function readConfigFile(): ConfigFile | null {
@@ -91,25 +114,68 @@ function readConfigFile(): ConfigFile | null {
   }
 }
 
-function getSettings(): Settings {
+/**
+ * Read the config file and normalize it to the multi-account shape.
+ * The legacy single-account shape ({ email, appPassword }) is treated as one
+ * account keyed by its email address. Returns null when no usable account
+ * exists (missing or corrupt file).
+ */
+function readNormalized(): NormalizedConfig | null {
   const cfg = readConfigFile();
+  if (!cfg) return null;
+  const accounts: Record<string, Credentials> = {};
+  let legacySingle = false;
+  if (cfg.accounts && typeof cfg.accounts === "object") {
+    for (const [name, entry] of Object.entries(cfg.accounts)) {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.email === "string" &&
+        entry.email.trim() &&
+        typeof entry.appPassword === "string" &&
+        entry.appPassword
+      ) {
+        accounts[name] = { email: entry.email.trim(), appPassword: entry.appPassword.replace(/\s+/g, "") };
+      }
+    }
+  }
+  if (
+    Object.keys(accounts).length === 0 &&
+    typeof cfg.email === "string" &&
+    cfg.email.trim() &&
+    typeof cfg.appPassword === "string" &&
+    cfg.appPassword
+  ) {
+    const email = cfg.email.trim();
+    accounts[email] = { email, appPassword: cfg.appPassword.replace(/\s+/g, "") };
+    legacySingle = true;
+  }
+  if (Object.keys(accounts).length === 0) return null;
+  const names = Object.keys(accounts);
+  let defaultAccount: string | undefined;
+  if (typeof cfg.defaultAccount === "string" && accounts[cfg.defaultAccount]) {
+    defaultAccount = cfg.defaultAccount;
+  } else if (legacySingle && names.length === 1) {
+    // A legacy single-account config implicitly uses that account.
+    defaultAccount = names[0];
+  }
   return {
-    allowSend: cfg?.settings?.allowSend ?? DEFAULT_SETTINGS.allowSend,
-    confirmSends: cfg?.settings?.confirmSends ?? DEFAULT_SETTINGS.confirmSends,
+    accounts,
+    defaultAccount,
+    settings: {
+      allowSend: cfg.settings?.allowSend ?? DEFAULT_SETTINGS.allowSend,
+      confirmSends: cfg.settings?.confirmSends ?? DEFAULT_SETTINGS.confirmSends,
+    },
   };
 }
 
-function getCredentials(): Credentials | null {
-  const envEmail = process.env.GMAIL_EMAIL?.trim();
-  const envPass = process.env.GMAIL_APP_PASSWORD?.trim();
-  if (envEmail && envPass) {
-    return { email: envEmail, appPassword: envPass.replace(/\s+/g, "") };
-  }
-  const cfg = readConfigFile();
-  if (cfg?.email?.trim() && cfg?.appPassword) {
-    return { email: cfg.email.trim(), appPassword: cfg.appPassword.replace(/\s+/g, "") };
-  }
-  return null;
+function getSettings(): Settings {
+  return readNormalized()?.settings ?? DEFAULT_SETTINGS;
+}
+
+/** Summaries of the configured accounts (name + email), for commands. */
+function listAccountSummaries(): Array<{ name: string; email: string }> {
+  return Object.entries(readNormalized()?.accounts ?? {}).map(([name, a]) => ({ name, email: a.email }));
 }
 
 function writeConfigFile(next: ConfigFile): void {
@@ -118,34 +184,105 @@ function writeConfigFile(next: ConfigFile): void {
   chmodSync(CONFIG_PATH, 0o600);
 }
 
-/** Save credentials, preserving any existing settings (or writing defaults). */
-function saveCredentials(email: string, appPassword: string): void {
-  const existing = readConfigFile();
+function writeNormalized(next: NormalizedConfig): void {
   writeConfigFile({
-    email,
-    appPassword,
-    settings: existing?.settings ?? DEFAULT_SETTINGS,
+    accounts: next.accounts,
+    ...(next.defaultAccount ? { defaultAccount: next.defaultAccount } : {}),
+    settings: next.settings,
   });
 }
 
-/** Save settings, preserving any existing credentials in the file. */
+/**
+ * Add or update an account, preserving settings and the default account.
+ * Returns the account key that was used (the given name, or the email
+ * address when no name was given). The first account added becomes the
+ * default.
+ */
+function saveAccount(name: string | undefined, email: string, appPassword: string): string {
+  const norm = readNormalized() ?? { accounts: {}, defaultAccount: undefined, settings: DEFAULT_SETTINGS };
+  const key = name?.trim() || email.trim();
+  norm.accounts[key] = { email: email.trim(), appPassword: appPassword.replace(/\s+/g, "") };
+  if (!norm.defaultAccount) norm.defaultAccount = key;
+  writeNormalized(norm);
+  return key;
+}
+
+/** Set the default account (used when a tool call does not name one). */
+function setDefaultAccount(name: string): void {
+  const norm = readNormalized();
+  if (!norm || !norm.accounts[name]) {
+    const list = Object.keys(norm?.accounts ?? {}).join(", ") || "(none)";
+    throw new Error(`Unknown account "${name}". Configured accounts: ${list}`);
+  }
+  norm.defaultAccount = name;
+  writeNormalized(norm);
+}
+
+/** Save settings, preserving all accounts in the file. */
 function saveSettings(settings: Settings): void {
-  const existing = readConfigFile() ?? {};
-  writeConfigFile({
-    ...(existing.email ? { email: existing.email } : {}),
-    ...(existing.appPassword ? { appPassword: existing.appPassword } : {}),
-    settings,
-  });
+  const norm = readNormalized();
+  if (norm) {
+    norm.settings = settings;
+    writeNormalized(norm);
+  } else {
+    writeConfigFile({ settings });
+  }
 }
 
 const NOT_CONFIGURED =
   "Gmail is not configured. Run /gmail-auth in pi, or set GMAIL_EMAIL and GMAIL_APP_PASSWORD. " +
   "App passwords: https://myaccount.google.com/apppasswords (requires 2-Step Verification).";
 
-function requireCredentials(): Credentials {
-  const creds = getCredentials();
-  if (!creds) throw new Error(NOT_CONFIGURED);
-  return creds;
+function accountListText(accounts: Record<string, Credentials>): string {
+  return Object.entries(accounts)
+    .map(([name, a]) => (name === a.email ? name : `${name} (${a.email})`))
+    .join(", ");
+}
+
+/**
+ * Resolve the account for a tool call:
+ *  - explicit `account` param → must match a configured account (name, full
+ *    email, or local part before the @), case-insensitive
+ *  - no param + GMAIL_EMAIL/GMAIL_APP_PASSWORD env → env credentials
+ *    (legacy single-account behavior, env wins)
+ *  - no param + one configured account → that account
+ *  - no param + several accounts → defaultAccount, or an error asking to pick
+ */
+function resolveAccount(requested?: string): Credentials {
+  const wanted = requested?.trim();
+  if (wanted) {
+    const norm = readNormalized();
+    if (!norm) throw new Error(NOT_CONFIGURED);
+    const lower = wanted.toLowerCase();
+    let name = Object.keys(norm.accounts).find((k) => k.toLowerCase() === lower);
+    if (!name) name = Object.keys(norm.accounts).find((k) => norm.accounts[k].email.toLowerCase() === lower);
+    if (!name) {
+      const local = lower.split("@")[0];
+      if (local) {
+        name = Object.keys(norm.accounts).find((k) => norm.accounts[k].email.split("@")[0].toLowerCase() === local);
+      }
+    }
+    if (!name) {
+      throw new Error(
+        `Unknown Gmail account "${wanted}". Configured accounts: ${accountListText(norm.accounts)}. Add one with /gmail-auth.`,
+      );
+    }
+    return norm.accounts[name];
+  }
+  const envEmail = process.env.GMAIL_EMAIL?.trim();
+  const envPass = process.env.GMAIL_APP_PASSWORD?.trim();
+  if (envEmail && envPass) {
+    return { email: envEmail, appPassword: envPass.replace(/\s+/g, "") };
+  }
+  const norm = readNormalized();
+  if (!norm) throw new Error(NOT_CONFIGURED);
+  const names = Object.keys(norm.accounts);
+  if (names.length === 1) return norm.accounts[names[0]];
+  if (norm.defaultAccount && norm.accounts[norm.defaultAccount]) return norm.accounts[norm.defaultAccount];
+  throw new Error(
+    `Multiple Gmail accounts are configured (${accountListText(norm.accounts)}) and no default account is set. ` +
+      'Pass the "account" parameter (name or email) to the Gmail tool, or set a default with /gmail-auth.',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +417,8 @@ export function __setSmtpTransportFactory(factory: SmtpTransportFactory | null):
 // IMAP operations
 // ---------------------------------------------------------------------------
 
-async function withImap<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
-  const creds = requireCredentials();
+async function withImap<T>(fn: (client: ImapFlow) => Promise<T>, account?: string): Promise<T> {
+  const creds = resolveAccount(account);
   const client = imapClientFactory(creds);
   try {
     await client.connect();
@@ -309,6 +446,7 @@ async function listEmails(opts: {
   limit: number;
   unreadOnly: boolean;
   query?: string;
+  account?: string;
 }): Promise<{ mailbox: string; count: number; emails: EmailSummary[] }> {
   return withImap(async (client) => {
     const mailbox = resolveFolder(opts.folder);
@@ -342,7 +480,7 @@ async function listEmails(opts: {
     }
     emails.reverse(); // fetch returns oldest first; show newest first
     return { mailbox, count: emails.length, emails };
-  });
+  }, opts.account);
 }
 
 interface EmailDetail {
@@ -358,7 +496,12 @@ interface EmailDetail {
   body: string;
 }
 
-async function readEmail(folder: string | undefined, uid: string, maxChars: number): Promise<EmailDetail> {
+async function readEmail(
+  folder: string | undefined,
+  uid: string,
+  maxChars: number,
+  account?: string,
+): Promise<EmailDetail> {
   return withImap(async (client) => {
     const mailbox = resolveFolder(folder);
     await client.mailboxOpen(mailbox, { readOnly: true });
@@ -386,13 +529,14 @@ async function readEmail(folder: string | undefined, uid: string, maxChars: numb
       })),
       body: truncate(body, maxChars),
     };
-  });
+  }, account);
 }
 
 async function markEmail(
   folder: string | undefined,
   uid: string,
   flag: "read" | "unread" | "starred" | "unstarred",
+  account?: string,
 ): Promise<string> {
   await withImap(async (client) => {
     const mailbox = resolveFolder(folder);
@@ -403,21 +547,21 @@ async function markEmail(
     } else {
       await client.messageFlagsRemove(uid, [imapFlag], { uid: true });
     }
-  });
+  }, account);
   return `Marked message ${uid} as ${flag}`;
 }
 
-async function moveEmail(folder: string | undefined, uid: string, to: string): Promise<string> {
+async function moveEmail(folder: string | undefined, uid: string, to: string, account?: string): Promise<string> {
   const dest = resolveFolder(to);
   await withImap(async (client) => {
     const mailbox = resolveFolder(folder);
     await client.mailboxOpen(mailbox, { readOnly: false });
     await client.messageMove(uid, dest, { uid: true });
-  });
+  }, account);
   return `Moved message ${uid} to ${dest}`;
 }
 
-async function listFolders(): Promise<{ name: string; messages: number; unread: number }[]> {
+async function listFolders(account?: string): Promise<{ name: string; messages: number; unread: number }[]> {
   return withImap(async (client) => {
     const list = await client.list({ statusQuery: { messages: true, unseen: true } });
     return list.map((m) => ({
@@ -425,7 +569,7 @@ async function listFolders(): Promise<{ name: string; messages: number; unread: 
       messages: m.status?.messages ?? 0,
       unread: m.status?.unseen ?? 0,
     }));
-  });
+  }, account);
 }
 
 export function findAttachmentPart(
@@ -451,6 +595,7 @@ async function saveAttachment(opts: {
   uid: string;
   filename: string;
   destPath: string;
+  account?: string;
 }): Promise<{ path: string; size: number; contentType: string }> {
   const MAX_BYTES = 100 * 1024 * 1024;
   return withImap(async (client) => {
@@ -474,7 +619,7 @@ async function saveAttachment(opts: {
       size: downloaded.content.length,
       contentType: downloaded.meta?.contentType ?? part.contentType,
     };
-  });
+  }, opts.account);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,8 +644,8 @@ const SMTP_ENDPOINTS: Array<{ host: string; port: number; secure: boolean }> = [
   { host: "smtp.gmail.com", port: 465, secure: true }, // implicit TLS
 ];
 
-async function sendMail(opts: SendOptions): Promise<string> {
-  const creds = requireCredentials();
+async function sendMail(opts: SendOptions, account?: string): Promise<string> {
+  const creds = resolveAccount(account);
   const mail: Record<string, unknown> = {
     from: creds.email,
     to: opts.to.join(","),
@@ -553,14 +698,19 @@ interface ReplyComputation {
 }
 
 /** Fetch the original message and derive the reply recipients/subject/headers. */
-async function prepareReply(folder: string | undefined, uid: string, toOverride?: string): Promise<ReplyComputation> {
+async function prepareReply(
+  folder: string | undefined,
+  uid: string,
+  toOverride?: string,
+  account?: string,
+): Promise<ReplyComputation> {
   const original = await withImap(async (client) => {
     const mailbox = resolveFolder(folder);
     await client.mailboxOpen(mailbox, { readOnly: true });
     const msg = await client.fetchOne(uid, { source: true }, { uid: true });
     if (!msg || !msg.source) throw new Error(`Message uid ${uid} not found in ${mailbox}`);
     return simpleParser(msg.source, { skipHtmlToText: true });
-  });
+  }, account);
 
   const replyTo = (toAddressList(original.headers?.get("reply-to")) ?? []).map((a) => a.address ?? "").filter(Boolean);
   const fromAddress = toAddressList(original.from)?.[0]?.address ?? "";
@@ -617,8 +767,8 @@ async function buildRawMail(creds: Credentials, opts: Omit<DraftOptions, "replac
   throw new Error("Unexpected MIME build result (expected a Buffer with buffer:true)");
 }
 
-async function createDraft(opts: DraftOptions): Promise<{ mailbox: string; size: number }> {
-  const creds = requireCredentials();
+async function createDraft(opts: DraftOptions, account?: string): Promise<{ mailbox: string; size: number }> {
+  const creds = resolveAccount(account);
   const raw = await buildRawMail(creds, opts);
 
   return withImap(async (client) => {
@@ -630,7 +780,7 @@ async function createDraft(opts: DraftOptions): Promise<{ mailbox: string; size:
     const res = await client.append(DRAFTS_FOLDER, raw, ["\\Draft"]);
     if (res === false) throw new Error("Gmail rejected the draft append");
     return { mailbox: res.destination, size: raw.length };
-  });
+  }, account);
 }
 
 // ---------------------------------------------------------------------------
@@ -714,18 +864,28 @@ const folderParam = Type.Optional(
   }),
 );
 
+const accountParam = Type.Optional(
+  Type.String({
+    description:
+      "Gmail account to use: account name or email address (e.g. 'support' or 'support@plaincode.com'). " +
+      "Only needed when multiple accounts are configured — otherwise the single/default account is used.",
+  }),
+);
+
 export default function (pi: ExtensionAPI) {
   // Descriptions reflect the active send mode at registration time; the tool
   // result text always states what actually happened.
   const settings = getSettings();
+  const multiAccountNote =
+    " If several Gmail accounts are configured, select one with the account parameter (name or email).";
   const sendDescription = (kind: "new email" | "reply"): string => {
     if (!settings.allowSend) {
-      return `Compose a ${kind} from the configured Gmail account. DRAFT-ONLY MODE (allowSend=false): this tool does NOT send — it saves the ${kind} to [Gmail]/Drafts for the user to review and send from Gmail.`;
+      return `Compose a ${kind} from a configured Gmail account. DRAFT-ONLY MODE (allowSend=false): this tool does NOT send — it saves the ${kind} to [Gmail]/Drafts for the user to review and send from Gmail.${multiAccountNote}`;
     }
     const confirm = settings.confirmSends
       ? " An interactive confirmation is requested right before sending; without an interactive UI (headless) the mail is saved as a draft instead."
       : " No confirmation is requested.";
-    return `Send a ${kind} from the configured Gmail account (allowSend=true).${confirm}`;
+    return `Send a ${kind} from a configured Gmail account (allowSend=true).${confirm}${multiAccountNote}`;
   };
   const sendSnippet = (kind: "new email" | "reply"): string =>
     settings.allowSend
@@ -738,10 +898,10 @@ export default function (pi: ExtensionAPI) {
     label: "Gmail Folders",
     description: "List Gmail folders/labels with message and unread counts",
     promptSnippet: "List Gmail folders with counts",
-    parameters: Type.Object({}),
-    async execute() {
+    parameters: Type.Object({ account: accountParam }),
+    async execute(_toolCallId, params) {
       try {
-        const folders = await listFolders();
+        const folders = await listFolders(params.account);
         const text = folders.map((f) => `${f.name}  (${f.messages} messages, ${f.unread} unread)`).join("\n");
         return textResult(`Gmail folders:\n${text}`, { folders });
       } catch (error) {
@@ -764,6 +924,7 @@ export default function (pi: ExtensionAPI) {
       ),
       unreadOnly: Type.Optional(Type.Boolean({ description: "Only unread messages (default false)" })),
       query: Type.Optional(Type.String({ description: "Optional full-text search term (IMAP SEARCH TEXT)" })),
+      account: accountParam,
     }),
     async execute(_toolCallId, params) {
       try {
@@ -773,6 +934,7 @@ export default function (pi: ExtensionAPI) {
           limit,
           unreadOnly: params.unreadOnly ?? false,
           query: params.query,
+          account: params.account,
         });
         if (result.count === 0) {
           const q = params.query ? ` matching "${params.query}"` : "";
@@ -807,10 +969,11 @@ export default function (pi: ExtensionAPI) {
       maxChars: Type.Optional(
         Type.Integer({ minimum: 200, maximum: 200000, description: "Max body chars (default 20000)" }),
       ),
+      account: accountParam,
     }),
     async execute(_toolCallId, params) {
       try {
-        const email = await readEmail(params.folder, params.id, params.maxChars ?? 20_000);
+        const email = await readEmail(params.folder, params.id, params.maxChars ?? 20_000, params.account);
         const attachments = email.attachments.length
           ? email.attachments.map((a) => `${a.filename} (${a.size} bytes, ${a.contentType})`).join("; ")
           : "(none)";
@@ -849,6 +1012,7 @@ export default function (pi: ExtensionAPI) {
       cc: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Cc recipient(s)" })),
       bcc: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Bcc recipient(s)" })),
       html: Type.Optional(Type.Boolean({ description: "Treat body as HTML (default false)" })),
+      account: accountParam,
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
@@ -861,10 +1025,10 @@ export default function (pi: ExtensionAPI) {
 
         const permission = await resolveSendPermission(ctx, { to: to.join(", "), subject: params.subject });
         if (permission.send) {
-          const messageId = await sendMail({ to, cc, bcc, subject: params.subject, text, html });
+          const messageId = await sendMail({ to, cc, bcc, subject: params.subject, text, html }, params.account);
           return textResult(`Sent to ${to.join(", ")} — subject: "${params.subject}" (Message-ID: ${messageId})`);
         }
-        const result = await createDraft({ to, cc, bcc, subject: params.subject, text, html });
+        const result = await createDraft({ to, cc, bcc, subject: params.subject, text, html }, params.account);
         return textResult(
           draftFallbackText(
             permission.reason ?? "sending was not permitted",
@@ -893,35 +1057,42 @@ export default function (pi: ExtensionAPI) {
       body: Type.String({ description: "Reply body (plain text, or HTML when html=true)" }),
       to: Type.Optional(Type.String({ description: "Override reply recipient (default: original Reply-To/From)" })),
       html: Type.Optional(Type.Boolean({ description: "Treat body as HTML (default false)" })),
+      account: accountParam,
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
-        const reply = await prepareReply(params.folder, params.id, params.to);
+        const reply = await prepareReply(params.folder, params.id, params.to, params.account);
         const text = params.html ? undefined : params.body;
         const html = params.html ? params.body : undefined;
 
         const permission = await resolveSendPermission(ctx, { to: reply.to.join(", "), subject: reply.subject });
         if (permission.send) {
-          const messageId = await sendMail({
+          const messageId = await sendMail(
+            {
+              to: reply.to,
+              subject: reply.subject,
+              text,
+              html,
+              inReplyTo: reply.inReplyTo,
+              references: reply.references,
+            },
+            params.account,
+          );
+          return textResult(
+            `Replied — to: ${reply.to.join(", ")}, subject: "${reply.subject}" (Message-ID: ${messageId})`,
+          );
+        }
+        const result = await createDraft(
+          {
             to: reply.to,
             subject: reply.subject,
             text,
             html,
             inReplyTo: reply.inReplyTo,
             references: reply.references,
-          });
-          return textResult(
-            `Replied — to: ${reply.to.join(", ")}, subject: "${reply.subject}" (Message-ID: ${messageId})`,
-          );
-        }
-        const result = await createDraft({
-          to: reply.to,
-          subject: reply.subject,
-          text,
-          html,
-          inReplyTo: reply.inReplyTo,
-          references: reply.references,
-        });
+          },
+          params.account,
+        );
         return textResult(
           draftFallbackText(
             permission.reason ?? "sending was not permitted",
@@ -954,18 +1125,22 @@ export default function (pi: ExtensionAPI) {
       replaceDraftId: Type.Optional(
         Type.String({ description: "Uid of an existing draft to delete first (from gmail_list folder=drafts)" }),
       ),
+      account: accountParam,
     }),
     async execute(_toolCallId, params) {
       try {
-        const result = await createDraft({
-          to: toTextList(params.to),
-          cc: toTextList(params.cc),
-          bcc: toTextList(params.bcc),
-          subject: params.subject,
-          text: params.html ? undefined : params.body,
-          html: params.html ? params.body : undefined,
-          replaceDraftId: params.replaceDraftId,
-        });
+        const result = await createDraft(
+          {
+            to: toTextList(params.to),
+            cc: toTextList(params.cc),
+            bcc: toTextList(params.bcc),
+            subject: params.subject,
+            text: params.html ? undefined : params.body,
+            html: params.html ? params.body : undefined,
+            replaceDraftId: params.replaceDraftId,
+          },
+          params.account,
+        );
         return textResult(
           `Draft saved to ${result.mailbox} (${result.size} bytes). It is NOT sent. List drafts with gmail_list folder=drafts.`,
         );
@@ -990,10 +1165,11 @@ export default function (pi: ExtensionAPI) {
         Type.Literal("starred"),
         Type.Literal("unstarred"),
       ]),
+      account: accountParam,
     }),
     async execute(_toolCallId, params) {
       try {
-        const message = await markEmail(params.folder, params.id, params.flag);
+        const message = await markEmail(params.folder, params.id, params.flag, params.account);
         return textResult(message);
       } catch (error) {
         return errorResult(error);
@@ -1011,10 +1187,11 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Message id (uid)" }),
       folder: folderParam,
       to: Type.String({ description: "Destination folder/label (e.g. trash, spam, or a custom label name)" }),
+      account: accountParam,
     }),
     async execute(_toolCallId, params) {
       try {
-        const message = await moveEmail(params.folder, params.id, params.to);
+        const message = await moveEmail(params.folder, params.id, params.to, params.account);
         return textResult(message);
       } catch (error) {
         return errorResult(error);
@@ -1033,6 +1210,7 @@ export default function (pi: ExtensionAPI) {
       folder: folderParam,
       filename: Type.String({ description: "Exact attachment filename (from gmail_read, case-insensitive)" }),
       destPath: Type.String({ description: "Local file path to save to (parent dirs are created)" }),
+      account: accountParam,
     }),
     async execute(_toolCallId, params) {
       try {
@@ -1041,6 +1219,7 @@ export default function (pi: ExtensionAPI) {
           uid: params.id,
           filename: params.filename,
           destPath: params.destPath,
+          account: params.account,
         });
         return textResult(`Saved attachment to ${result.path} (${result.size} bytes, ${result.contentType})`, result);
       } catch (error) {
@@ -1051,23 +1230,75 @@ export default function (pi: ExtensionAPI) {
 
   // ---- /gmail-auth -----------------------------------------------------------
   pi.registerCommand("gmail-auth", {
-    description: "Configure Gmail credentials (email + app password) and test the connection",
+    description: "Manage Gmail accounts (add, update, set default) and test the connection",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("/gmail-auth requires interactive mode", "error");
         return;
       }
 
-      const existing = getCredentials();
+      const existing = listAccountSummaries();
+      const updateLabel = (a: { name: string; email: string }) => `Update: ${a.name} — ${a.email}`;
+      const choice = await ctx.ui.select("Gmail accounts — choose an action", [
+        "Add a new account",
+        ...existing.map(updateLabel),
+        ...(existing.length > 0 ? ["Set default account"] : []),
+        "Done (no changes)",
+      ]);
+      if (!choice || choice.startsWith("Done")) return;
+
+      if (choice === "Set default account") {
+        const pick = await ctx.ui.select(
+          "Default account",
+          existing.map((a) => `${a.name} — ${a.email}`),
+        );
+        if (!pick) return;
+        const match = existing.find((a) => `${a.name} — ${a.email}` === pick);
+        if (!match) {
+          ctx.ui.notify(`Unknown choice: ${pick}`, "warning");
+          return;
+        }
+        try {
+          setDefaultAccount(match.name);
+          ctx.ui.notify(`Default account set to ${match.name} (${match.email}).`, "info");
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Could not set default account: ${msg}`, "error");
+        }
+        return;
+      }
+
+      // "Add a new account" or "Update: <name> — <email>".
+      let name: string | undefined;
+      if (choice.startsWith("Update: ")) {
+        const match = existing.find((a) => updateLabel(a) === choice);
+        if (!match) {
+          ctx.ui.notify(`Unknown choice: ${choice}`, "warning");
+          return;
+        }
+        name = match.name;
+      }
+
       const email = await ctx.ui.input(
         "Gmail account",
-        existing?.email
-          ? `Currently: ${existing.email} — enter email address:`
+        name
+          ? `Currently: ${existing.find((a) => a.name === name)?.email ?? ""} — enter email address:`
           : "Email address (e.g. support@plaincode.com):",
       );
       if (!email?.trim()) {
         ctx.ui.notify("Cancelled: no email address.", "error");
         return;
+      }
+      if (!name) {
+        const enteredName = await ctx.ui.input(
+          "Account name",
+          "Short name (e.g. support) — leave empty to use the email address",
+        );
+        if (enteredName === undefined) {
+          ctx.ui.notify("Cancelled.", "error");
+          return;
+        }
+        name = enteredName.trim() || undefined;
       }
       const appPassword = await ctx.ui.input(
         "Gmail app password",
@@ -1101,55 +1332,58 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
-        saveCredentials(creds.email, creds.appPassword);
+        const key = saveAccount(name, creds.email, creds.appPassword);
+        ctx.ui.notify(
+          `Gmail account ${key} configured for ${creds.email}. Inbox: ${inbox ? `${inbox.messages} messages, ${inbox.unread} unread` : "ok"}. ` +
+            `Sending mode: ${getSettings().allowSend ? "enabled" : "DRAFT-ONLY (default)"} — manage with /gmail-config.`,
+          "info",
+        );
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`Connected, but could not save config: ${msg}`, "warning");
-        return;
       }
-
-      ctx.ui.notify(
-        `Gmail configured for ${creds.email}. Inbox: ${inbox ? `${inbox.messages} messages, ${inbox.unread} unread` : "ok"}. ` +
-          `Sending mode: ${getSettings().allowSend ? "enabled" : "DRAFT-ONLY (default)"} — manage with /gmail-config.`,
-        "info",
-      );
     },
   });
 
   // ---- /gmail-status ----------------------------------------------------------
   pi.registerCommand("gmail-status", {
-    description: "Show Gmail config and test the IMAP connection",
+    description: "Show Gmail accounts + settings and test the IMAP connection of each account",
     handler: async (_args, ctx) => {
-      const creds = getCredentials();
-      if (!creds) {
+      const norm = readNormalized();
+      if (!norm) {
         ctx.ui.notify(NOT_CONFIGURED, "error");
         return;
       }
-      const settings = getSettings();
+      const settings = norm.settings;
+      const accountLines = Object.entries(norm.accounts).map(
+        ([name, a]) => `  ${name} — ${a.email}${name === norm.defaultAccount ? " (default)" : ""}`,
+      );
       ctx.ui.notify(
-        `Account: ${creds.email}\n` +
+        `Accounts:\n${accountLines.join("\n")}\n` +
           `allowSend: ${settings.allowSend} — ${settings.allowSend ? "gmail_send/gmail_reply send emails" : "DRAFT-ONLY: gmail_send/gmail_reply save drafts, never send"}\n` +
           `confirmSends: ${settings.confirmSends} — ${settings.confirmSends ? "asks for confirmation before each send" : "sends without confirmation (when allowSend is true)"}`,
         "info",
       );
-      ctx.ui.notify("Testing IMAP connection…", "info");
-      const client = imapClientFactory(creds);
-      try {
-        await client.connect();
-        const list = await client.list({ statusQuery: { messages: true, unseen: true } });
-        const inbox = list.find((m) => m.path === "INBOX");
-        ctx.ui.notify(
-          `Connected. ${list.length} folders. Inbox: ${inbox?.status ? `${inbox.status.messages ?? 0} messages, ${inbox.status.unseen ?? 0} unread` : "n/a"}.`,
-          "info",
-        );
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`Connection failed: ${msg}`, "error");
-      } finally {
+      for (const [name, creds] of Object.entries(norm.accounts)) {
+        ctx.ui.notify(`Testing IMAP connection (${name} — ${creds.email})…`, "info");
+        const client = imapClientFactory(creds);
         try {
-          await client.logout();
-        } catch {
-          // ignore
+          await client.connect();
+          const list = await client.list({ statusQuery: { messages: true, unseen: true } });
+          const inbox = list.find((m) => m.path === "INBOX");
+          ctx.ui.notify(
+            `Connected. ${list.length} folders. Inbox: ${inbox?.status ? `${inbox.status.messages ?? 0} messages, ${inbox.status.unseen ?? 0} unread` : "n/a"}.`,
+            "info",
+          );
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Connection failed: ${msg}`, "error");
+        } finally {
+          try {
+            await client.logout();
+          } catch {
+            // ignore
+          }
         }
       }
     },
@@ -1160,9 +1394,9 @@ export default function (pi: ExtensionAPI) {
     description: "Show Gmail settings (allowSend, confirmSends) and toggle them (persisted to config.json, mode 0600)",
     handler: async (_args, ctx) => {
       const settings = getSettings();
-      const creds = getCredentials();
+      const accounts = Object.entries(readNormalized()?.accounts ?? {}).map(([n, a]) => `${n} (${a.email})`);
       const summary =
-        `Account: ${creds?.email ?? "(not configured)"}\n` +
+        `Accounts: ${accounts.length ? accounts.join(", ") : "(none configured)"}\n` +
         `allowSend: ${settings.allowSend} — ${settings.allowSend ? "gmail_send/gmail_reply send emails" : "DRAFT-ONLY: gmail_send/gmail_reply save drafts, never send"}\n` +
         `confirmSends: ${settings.confirmSends} — ${settings.confirmSends ? "asks for confirmation before each send" : "sends without confirmation (when allowSend is true)"}`;
 
@@ -1220,10 +1454,13 @@ export default function (pi: ExtensionAPI) {
 
   // ---- session_start notice ---------------------------------------------------
   pi.on("session_start", async (_event, ctx) => {
-    const creds = getCredentials();
+    const norm = readNormalized();
     const mode = getSettings().allowSend ? "sending enabled" : "DRAFT-ONLY mode (sending disabled)";
-    if (creds) {
-      ctx.ui.notify(`Gmail ready: ${creds.email} — ${mode}`, "info");
+    if (norm) {
+      const accounts = Object.entries(norm.accounts)
+        .map(([n, a]) => `${a.email}${n === norm.defaultAccount ? " (default)" : ""}`)
+        .join(", ");
+      ctx.ui.notify(`Gmail ready: ${accounts} — ${mode}`, "info");
     } else {
       ctx.ui.notify(`Gmail extension loaded — run /gmail-auth to configure. ${mode}.`, "info");
     }

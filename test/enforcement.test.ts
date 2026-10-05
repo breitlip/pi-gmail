@@ -37,8 +37,34 @@ function writeConfig(settings: Record<string, unknown>, creds?: { email: string;
   );
 }
 
-function readConfig(): { email?: string; appPassword?: string; settings?: Record<string, unknown> } {
+function readConfig(): {
+  email?: string;
+  appPassword?: string;
+  accounts?: Record<string, { email?: string; appPassword?: string }>;
+  defaultAccount?: string;
+  settings?: Record<string, unknown>;
+} {
   return JSON.parse(readFileSync(CONFIG, "utf8"));
+}
+
+/** Write a multi-account (v2) config file. */
+function writeMultiConfig(opts: {
+  accounts: Record<string, { email: string; appPassword: string }>;
+  defaultAccount?: string;
+  settings?: Record<string, unknown>;
+}) {
+  writeFileSync(
+    CONFIG,
+    JSON.stringify(
+      {
+        accounts: opts.accounts,
+        ...(opts.defaultAccount ? { defaultAccount: opts.defaultAccount } : {}),
+        settings: opts.settings ?? { allowSend: false, confirmSends: true },
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 // Default state: draft-only (safe default).
@@ -250,7 +276,8 @@ test("/gmail-config toggles allowSend and persists config at mode 0600", async (
   const cfg = readConfig();
   assert.equal(cfg.settings?.allowSend, false);
   assert.equal(cfg.settings?.confirmSends, false, "unrelated setting must be preserved");
-  assert.equal(cfg.email, "test@example.com", "credentials must be preserved");
+  // Legacy credentials must survive the write (migrated to the accounts map).
+  assert.equal(cfg.accounts?.["test@example.com"]?.email, "test@example.com", "credentials must be preserved");
   assert.equal(statSync(CONFIG).mode & 0o777, 0o600, "config file must stay mode 0600");
   assert.ok(m.notifications.some((n) => /Settings saved/.test(n.message)));
 });
@@ -276,24 +303,25 @@ test("/gmail-config works headless (read-only summary)", async () => {
 // 5. /gmail-auth: saves credentials, preserves settings, mode 0600
 // ---------------------------------------------------------------------------
 
-test("/gmail-auth saves credentials, preserves settings, keeps mode 0600", async () => {
+test("/gmail-auth adds an account, preserves settings, keeps mode 0600", async () => {
   writeConfig({ allowSend: false, confirmSends: true });
   const command = mock.commands.get("gmail-auth");
   assert.ok(command, "gmail-auth command must be registered");
 
   const m = makeCtx({
     hasUI: true,
-    inputAnswers: ["new@example.com", "abcd efgh ijkl mnop"],
+    selectAnswer: "Add a new account",
+    inputAnswers: ["work@example.com", "work", "abcd efgh ijkl mnop"],
   });
   await command.handler("", m.ctx);
 
   const cfg = readConfig();
-  assert.equal(cfg.email, "new@example.com");
-  assert.equal(cfg.appPassword, "abcdefghijklmnop", "whitespace must be stripped");
+  assert.equal(cfg.accounts?.work?.email, "work@example.com");
+  assert.equal(cfg.accounts?.work?.appPassword, "abcdefghijklmnop", "whitespace must be stripped");
   assert.equal(cfg.settings?.allowSend, false, "existing settings must survive /gmail-auth");
   assert.equal(cfg.settings?.confirmSends, true);
   assert.equal(statSync(CONFIG).mode & 0o777, 0o600);
-  assert.ok(m.notifications.some((n) => /Gmail configured for new@example\.com/.test(n.message)));
+  assert.ok(m.notifications.some((n) => /configured for work@example\.com/.test(n.message)));
 });
 
 // ---------------------------------------------------------------------------
@@ -334,4 +362,156 @@ test("corrupt config file is treated as unconfigured", async () => {
   // No credentials → clear NOT_CONFIGURED error, not a crash.
   assert.equal(res.isError, true);
   assert.match(resultText(res), /not configured/i);
+});
+
+// ---------------------------------------------------------------------------
+// 8. Multi-account: resolution, account param, legacy migration, default
+// ---------------------------------------------------------------------------
+
+const MULTI_ACCOUNTS: Record<string, { email: string; appPassword: string }> = {
+  support: { email: "support@example.com", appPassword: "abcdefghijklmnop" },
+  pb: { email: "pb@example.com", appPassword: "qrstuvwxyz123456" },
+};
+
+type ExecResult = { content: Array<{ text: string }>; isError?: boolean };
+
+test("multi-account: no account param uses the default account", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS, defaultAccount: "support" });
+  const tool = getTool(mock, "gmail_draft");
+  const m = makeCtx();
+  const res = (await tool.execute(
+    "m1",
+    { subject: "Default account draft", body: "Body" },
+    undefined,
+    undefined,
+    m.ctx,
+  )) as ExecResult;
+
+  assert.equal(res.isError, undefined, resultText(res));
+  const draft = lastAppend();
+  assert.match(draft.mime, /From:\s*support@example\.com/i);
+});
+
+test("multi-account: account param by name selects that account", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS, defaultAccount: "support" });
+  const tool = getTool(mock, "gmail_draft");
+  const m = makeCtx();
+  const res = (await tool.execute(
+    "m2",
+    { subject: "Named account draft", body: "Body", account: "pb" },
+    undefined,
+    undefined,
+    m.ctx,
+  )) as ExecResult;
+
+  assert.equal(res.isError, undefined, resultText(res));
+  const draft = lastAppend();
+  assert.match(draft.mime, /From:\s*pb@example\.com/i);
+});
+
+test("multi-account: account param by email (case-insensitive) selects that account", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS, defaultAccount: "support" });
+  const tool = getTool(mock, "gmail_draft");
+  const m = makeCtx();
+  const res = (await tool.execute(
+    "m3",
+    { subject: "Email account draft", body: "Body", account: "PB@example.com" },
+    undefined,
+    undefined,
+    m.ctx,
+  )) as ExecResult;
+
+  assert.equal(res.isError, undefined, resultText(res));
+  const draft = lastAppend();
+  assert.match(draft.mime, /From:\s*pb@example\.com/i);
+});
+
+test("multi-account: account param by local part (before @) selects that account", async () => {
+  // Account names differ from the email local parts here, so only the
+  // local-part match can resolve "support".
+  writeMultiConfig({
+    accounts: {
+      work: { email: "support@example.com", appPassword: "abcdefghijklmnop" },
+      home: { email: "pb@example.com", appPassword: "qrstuvwxyz123456" },
+    },
+    defaultAccount: "home",
+  });
+  const tool = getTool(mock, "gmail_draft");
+  const m = makeCtx();
+  const res = (await tool.execute(
+    "m4",
+    { subject: "Local part draft", body: "Body", account: "support" },
+    undefined,
+    undefined,
+    m.ctx,
+  )) as ExecResult;
+
+  assert.equal(res.isError, undefined, resultText(res));
+  const draft = lastAppend();
+  assert.match(draft.mime, /From:\s*support@example\.com/i);
+});
+
+test("multi-account: unknown account → clear error listing configured accounts", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS, defaultAccount: "support" });
+  const tool = getTool(mock, "gmail_folders");
+  const m = makeCtx();
+  const res = (await tool.execute("m5", { account: "nope" }, undefined, undefined, m.ctx)) as ExecResult;
+
+  assert.equal(res.isError, true);
+  assert.match(resultText(res), /Unknown Gmail account "nope"/);
+  assert.match(resultText(res), /support@example\.com/);
+  assert.match(resultText(res), /pb@example\.com/);
+});
+
+test("multi-account: several accounts, no default, no param → error asking to pick", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS }); // no defaultAccount
+  const tool = getTool(mock, "gmail_folders");
+  const m = makeCtx();
+  const res = (await tool.execute("m6", {}, undefined, undefined, m.ctx)) as ExecResult;
+
+  assert.equal(res.isError, true);
+  assert.match(resultText(res), /no default account is set/i);
+  assert.match(resultText(res), /"account" parameter/);
+});
+
+test("legacy config migrates to the accounts map when a second account is added", async () => {
+  writeConfig({ allowSend: false, confirmSends: true }); // legacy single account
+  const command = getCommand("gmail-auth");
+  const m = makeCtx({
+    hasUI: true,
+    selectAnswer: "Add a new account",
+    inputAnswers: ["second@example.com", "second", "qrstuvwxyz123456"],
+  });
+  await command.handler("", m.ctx);
+
+  const cfg = readConfig();
+  assert.equal(cfg.accounts?.["test@example.com"]?.email, "test@example.com", "legacy account must be preserved");
+  assert.equal(cfg.accounts?.second?.email, "second@example.com");
+  assert.equal(cfg.defaultAccount, "test@example.com", "legacy account becomes the default");
+  assert.equal(cfg.settings?.allowSend, false, "settings must be preserved");
+});
+
+test("/gmail-auth sets the default account", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS, defaultAccount: "support" });
+  const command = getCommand("gmail-auth");
+  const m = makeCtx({
+    hasUI: true,
+    selectAnswers: ["Set default account", "pb — pb@example.com"],
+  });
+  await command.handler("", m.ctx);
+
+  const cfg = readConfig();
+  assert.equal(cfg.defaultAccount, "pb");
+  assert.equal(cfg.accounts?.support?.email, "support@example.com", "accounts must be preserved");
+});
+
+test("/gmail-status lists all accounts with the default marked", async () => {
+  writeMultiConfig({ accounts: MULTI_ACCOUNTS, defaultAccount: "support" });
+  const command = getCommand("gmail-status");
+  const m = makeCtx({ hasUI: false });
+  await command.handler("", m.ctx);
+
+  const all = m.notifications.map((n) => n.message).join("\n");
+  assert.match(all, /support — support@example\.com \(default\)/);
+  assert.match(all, /pb — pb@example\.com/);
 });

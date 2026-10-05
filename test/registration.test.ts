@@ -47,35 +47,35 @@ test("subscribes to session_start", () => {
 const SAMPLES: Record<string, { valid: Record<string, unknown>; invalid?: Record<string, unknown> }> = {
   gmail_folders: { valid: {} },
   gmail_list: {
-    valid: { folder: "inbox", limit: 5, unreadOnly: false, query: "test" },
+    valid: { folder: "inbox", limit: 5, unreadOnly: false, query: "test", account: "support" },
     invalid: { limit: 0 },
   },
   gmail_read: {
-    valid: { id: "123", folder: "inbox", maxChars: 5000 },
+    valid: { id: "123", folder: "inbox", maxChars: 5000, account: "support@plaincode.com" },
     invalid: {},
   },
   gmail_send: {
-    valid: { to: "a@b.c", subject: "s", body: "b", cc: ["c@d.e"], bcc: "e@f.g", html: false },
+    valid: { to: "a@b.c", subject: "s", body: "b", cc: ["c@d.e"], bcc: "e@f.g", html: false, account: "pb" },
     invalid: {},
   },
   gmail_reply: {
-    valid: { id: "1", body: "b", folder: "inbox", to: "a@b.c", html: true },
+    valid: { id: "1", body: "b", folder: "inbox", to: "a@b.c", html: true, account: "pb" },
     invalid: { body: "no id" },
   },
   gmail_draft: {
-    valid: { subject: "s", body: "b", to: ["a@b.c"], html: false, replaceDraftId: "9" },
+    valid: { subject: "s", body: "b", to: ["a@b.c"], html: false, replaceDraftId: "9", account: "pb" },
     invalid: { body: "no subject" },
   },
   gmail_mark: {
-    valid: { id: "1", flag: "read" },
+    valid: { id: "1", flag: "read", account: "support" },
     invalid: { id: "1", flag: "bogus" },
   },
   gmail_move: {
-    valid: { id: "1", to: "trash" },
+    valid: { id: "1", to: "trash", account: "support" },
     invalid: { to: "trash" },
   },
   gmail_save_attachment: {
-    valid: { id: "1", filename: "a.txt", destPath: "/tmp/a.txt", folder: "inbox" },
+    valid: { id: "1", filename: "a.txt", destPath: "/tmp/a.txt", folder: "inbox", account: "support" },
     invalid: { id: "1", destPath: "/tmp/a.txt" },
   },
 };
@@ -95,6 +95,15 @@ test("every tool has a valid typebox object schema that accepts good params and 
     if (sample.invalid !== undefined) {
       assert.ok(!Value.Check(tool.parameters, sample.invalid), `${tool.name}: invalid sample was accepted`);
     }
+  }
+});
+
+test("every tool declares the optional account parameter", () => {
+  const mock = register();
+  for (const tool of mock.tools) {
+    const schema = tool.parameters as { properties?: Record<string, unknown>; required?: string[] };
+    assert.ok(schema.properties?.account, `${tool.name}: missing the optional account parameter`);
+    assert.ok(!(schema.required ?? []).includes("account"), `${tool.name}: account must be optional`);
   }
 });
 

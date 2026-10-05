@@ -56,6 +56,21 @@ human in the loop.
 > model a live email account. Revoke app passwords any time at
 > <https://myaccount.google.com/apppasswords>.
 
+## Multi-account
+
+You can configure several Google accounts in one config file. Every tool
+accepts an optional **`account`** parameter — an account name or email
+address (e.g. `"support"` or `"support@plaincode.com"`, case-insensitive, the
+local part before the `@` also works). Without it:
+
+- one account configured → that account is used
+- several configured → the **default account** is used (set with
+  `/gmail-auth` → *Set default account*), or the tool errors and lists the
+  configured accounts
+
+`GMAIL_EMAIL` / `GMAIL_APP_PASSWORD` env overrides still apply, but only when
+a tool call does **not** name an account (env wins over the file, as before).
+
 ## Settings & config file
 
 The config file next to the extension (default:
@@ -64,20 +79,28 @@ The config file next to the extension (default:
 
 ```json
 {
-  "email": "you@example.com",
-  "appPassword": "abcd efgh ijkl mnop",
+  "defaultAccount": "support",
+  "accounts": {
+    "support": { "email": "support@example.com", "appPassword": "abcd efgh ijkl mnop" },
+    "pb": { "email": "pb@example.com", "appPassword": "qrst uvwx yzab 1234" }
+  },
   "settings": { "allowSend": false, "confirmSends": true }
 }
 ```
 
-- **Backward compatible:** older two-key configs (`email` + `appPassword` only)
-  keep working — missing `settings` fall back to the safe defaults
+- **Backward compatible:** the legacy single-account shape
+  (`{ "email", "appPassword", "settings" }`) keeps working — it is treated as
+  one account (keyed by its email address, implicitly the default) and
+  migrated to the multi-account shape the next time the config is written.
+  Missing `settings` fall back to the safe defaults
   (`allowSend: false`, `confirmSends: true`).
-- `/gmail-auth` manages **credentials** (and preserves existing settings).
-- `/gmail-config` manages **settings** (and preserves existing credentials).
+- `/gmail-auth` manages **accounts** (add, update, set default — and
+  preserves existing settings).
+- `/gmail-config` manages **settings** (and preserves all accounts).
 - Both keep the file at mode **0600**.
 - `GMAIL_EMAIL` / `GMAIL_APP_PASSWORD` env overrides for credentials stay as
-  they were (env wins over the file).
+  they were (env wins over the file, only for calls without an `account`
+  parameter).
 
 ## Tools
 
@@ -93,13 +116,17 @@ The config file next to the extension (default:
 | `gmail_move` | Move to another folder/label (e.g. `trash`, `spam`, custom label) |
 | `gmail_save_attachment` | Download an attachment to a local file (max 100 MB) |
 
+All tools accept the optional `account` parameter (see [Multi-account](#multi-account)).
+
 Folder aliases: `inbox`, `sent`, `starred`, `drafts`, `spam`, `trash`,
 `important`, `all` — or pass an exact label/folder name.
 
 ## Commands
 
-- `/gmail-auth` — configure credentials and test the connection
-- `/gmail-status` — show account + settings and test the IMAP connection
+- `/gmail-auth` — manage accounts (add a new one, update an existing one,
+  set the default) and test the connection
+- `/gmail-status` — show all accounts + settings and test the IMAP
+  connection of each account
 - `/gmail-config` — show settings and toggle `allowSend` / `confirmSends`
   (persisted to the config file, mode 0600)
 

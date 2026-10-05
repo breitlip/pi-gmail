@@ -24,9 +24,26 @@ function liveCredentials(): { email: string; appPassword: string } | null {
     process.env.GMAIL_CONFIG_PATH?.trim() || join(homedir(), ".pi", "agent", "extensions", "gmail", "config.json");
   if (existsSync(path)) {
     try {
-      const cfg = JSON.parse(readFileSync(path, "utf8")) as { email?: string; appPassword?: string };
+      const cfg = JSON.parse(readFileSync(path, "utf8")) as {
+        email?: string;
+        appPassword?: string;
+        defaultAccount?: string;
+        accounts?: Record<string, { email?: string; appPassword?: string }>;
+      };
+      // Legacy single-account shape.
       if (cfg.email?.trim() && cfg.appPassword) {
         return { email: cfg.email.trim(), appPassword: cfg.appPassword.replace(/\s+/g, "") };
+      }
+      // Multi-account shape: prefer the default account, else the first one.
+      if (cfg.accounts) {
+        const names = Object.keys(cfg.accounts);
+        const name = (cfg.defaultAccount && names.includes(cfg.defaultAccount) ? cfg.defaultAccount : names[0]) as
+          | string
+          | undefined;
+        const entry = name ? cfg.accounts[name] : undefined;
+        if (entry?.email?.trim() && entry.appPassword) {
+          return { email: entry.email.trim(), appPassword: entry.appPassword.replace(/\s+/g, "") };
+        }
       }
     } catch {
       // fall through

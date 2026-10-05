@@ -18,7 +18,8 @@ package (devDependency).
 - **Never rename tools or change parameter shapes** — other pi sessions rely on
   `gmail_folders`, `gmail_list`, `gmail_read`, `gmail_send`, `gmail_reply`,
   `gmail_draft`, `gmail_mark`, `gmail_move`, `gmail_save_attachment` and their
-  current parameters.
+  current parameters. Additive optional parameters (like `account`) are fine;
+  removing or tightening existing ones is not.
 - **Draft-only is the safe default.** `allowSend` defaults to `false`; do not
   flip the default or make sending reachable without an explicit user toggle.
 - **Never commit `config.json`, `node_modules`, or credentials** (gitignored).
@@ -62,8 +63,18 @@ CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check` on push/PR.
 - **Replies**: `prepareReply()` fetches the original once and derives
   `to`/`subject`/`inReplyTo`/`references`; both the send and the draft path use
   the same derived headers.
-- Config file shape: `{ email, appPassword, settings: { allowSend, confirmSends } }`.
-  Legacy two-key files must keep working (missing `settings` ⇒ safe defaults).
+- Config file shape (multi-account): `{ defaultAccount?, accounts: { name: { email, appPassword } }, settings: { allowSend, confirmSends } }`.
+  Legacy single-account files (`{ email, appPassword, settings }`) must keep working —
+  `readNormalized()` treats them as one account (keyed by email, implicitly the
+  default) and `saveAccount`/`saveSettings` migrate them to the multi-account
+  shape on the next write.
+- Multi-account: every tool takes an optional `account` param (name, email, or
+  local part — case-insensitive). Resolution: explicit param → env credentials
+  (only when no param) → single account → `defaultAccount` → error listing
+  accounts. `resolveAccount()` is the only place that resolves; IMAP/SMTP
+  helpers take the raw `account?: string` and pass it through.
+- The `account` param is validated against configured accounts only — never
+  accept free-form credentials from tool parameters.
 
 ## Gotchas (learned the hard way — do not regress)
 
