@@ -109,20 +109,21 @@ CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check` on push/PR.
 
 ## Live install & release flow
 
-- The dev machine's live install is `~/.pi/agent/extensions/gmail` — a **git
-  clone of this repo** with an **untracked `config.json`** (the real
-  credentials). After pushing to `main`:
+- The dev machine's live install is a **local pi package** pointing at the
+  canonical dev checkout in the Plaincode hub workspace:
 
   ```bash
-  cd ~/.pi/agent/extensions/gmail && git pull && npm install
-  # verify: config.json still present, mode 600; git status clean
+  pi install /home/breitlip/Source/plaincode/repos/tools/pi-gmail
   ```
 
-  Alternative: install as a pi package with
-  `pi install git:github.com/breitlip/pi-gmail` (clones into
-  `~/.pi/agent/git/...`, runs `npm install`). The config file is unaffected
-  either way — `CONFIG_PATH` is fixed at
-  `~/.pi/agent/extensions/gmail/config.json` regardless of where the code lives.
+  Pi loads it from the resolved path **without copying**, so working-tree
+  edits are live in new pi sessions (running sessions keep the code they
+  loaded). Run `npm install` in the checkout when dependencies change.
+  Credentials are unaffected — `CONFIG_PATH` is fixed at
+  `~/.pi/agent/extensions/gmail/config.json` regardless of where the code
+  lives. A pinned remote install
+  (`pi install git:github.com/breitlip/pi-gmail@vX.Y.Z`) is the alternative
+  for stable setups on other machines.
 
 - Smoke-test that pi still loads the extension, e.g.:
 
@@ -135,5 +136,4 @@ CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check` on push/PR.
   create a draft in `[Gmail]/Drafts` (clean up test drafts afterwards via IMAP
   `search` + `messageDelete`).
 - Commit with clear messages; push to `main` on `origin`
-  (`git@github.com:breitlip/pi-gmail.git`). CI must be green before syncing the
-  live install.
+  (`git@github.com:breitlip/pi-gmail.git`). CI must be green before pushing.
