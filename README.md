@@ -84,7 +84,7 @@ The config file next to the extension (default:
     "support": { "email": "support@example.com", "appPassword": "abcd efgh ijkl mnop" },
     "pb": { "email": "pb@example.com", "appPassword": "qrst uvwx yzab 1234" }
   },
-  "settings": { "allowSend": false, "confirmSends": true }
+  "settings": { "allowSend": false, "confirmSends": true, "bcc": ["self"] }
 }
 ```
 
@@ -94,6 +94,11 @@ The config file next to the extension (default:
   migrated to the multi-account shape the next time the config is written.
   Missing `settings` fall back to the safe defaults
   (`allowSend: false`, `confirmSends: true`).
+- **`settings.bcc`** (optional): addresses always appended to Bcc on
+  `gmail_send` / `gmail_reply` / `gmail_draft` (deduped against the per-call
+  `bcc` parameter). The special value `"self"` resolves to the sending
+  account's own email address — e.g. `"bcc": ["self"]` keeps a copy of every
+  outgoing mail in the sender's inbox. Default: none.
 - `/gmail-auth` manages **accounts** (add, update, set default — and
   preserves existing settings).
 - `/gmail-config` manages **settings** (and preserves all accounts).

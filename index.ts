@@ -80,6 +80,12 @@ interface Settings {
    * drafting. Set to false to allow unattended sends.
    */
   confirmSends: boolean;
+  /**
+   * Addresses always appended to Bcc on gmail_send/gmail_reply/gmail_draft.
+   * The special value "self" resolves to the sending account's own email
+   * address. Default: none.
+   */
+  bcc?: string[];
 }
 
 const DEFAULT_SETTINGS: Settings = { allowSend: false, confirmSends: true };
@@ -165,6 +171,9 @@ function readNormalized(): NormalizedConfig | null {
     settings: {
       allowSend: cfg.settings?.allowSend ?? DEFAULT_SETTINGS.allowSend,
       confirmSends: cfg.settings?.confirmSends ?? DEFAULT_SETTINGS.confirmSends,
+      bcc: Array.isArray(cfg.settings?.bcc)
+        ? cfg.settings.bcc.filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim())
+        : undefined,
     },
   };
 }
@@ -637,6 +646,21 @@ interface SendOptions {
   references?: string[];
 }
 
+/**
+ * Merge the configured default Bcc (settings.bcc) with the per-call Bcc.
+ * "self" resolves to the sending account's email address. Duplicates are
+ * removed case-insensitively; explicit per-call addresses keep their order.
+ */
+export function resolveBcc(senderEmail: string, explicit?: string[]): string[] | undefined {
+  const configured = getSettings().bcc ?? [];
+  const merged: string[] = [...(explicit ?? [])];
+  for (const entry of configured) {
+    const addr = entry === "self" ? senderEmail : entry;
+    if (!merged.some((a) => a.toLowerCase() === addr.toLowerCase())) merged.push(addr);
+  }
+  return merged.length ? merged : undefined;
+}
+
 // Some networks block implicit-TLS 465 but allow STARTTLS 587 (or vice versa),
 // so try both with short explicit timeouts instead of hanging on the default 2 min.
 const SMTP_ENDPOINTS: Array<{ host: string; port: number; secure: boolean }> = [
@@ -646,11 +670,12 @@ const SMTP_ENDPOINTS: Array<{ host: string; port: number; secure: boolean }> = [
 
 async function sendMail(opts: SendOptions, account?: string): Promise<string> {
   const creds = resolveAccount(account);
+  const bcc = resolveBcc(creds.email, opts.bcc);
   const mail: Record<string, unknown> = {
     from: creds.email,
     to: opts.to.join(","),
     cc: opts.cc?.join(","),
-    bcc: opts.bcc?.join(","),
+    bcc: bcc?.join(","),
     subject: opts.subject,
     text: opts.text,
     html: opts.html,
@@ -751,11 +776,12 @@ interface DraftOptions {
 /** Build the raw MIME message without any network access (stream transport). */
 async function buildRawMail(creds: Credentials, opts: Omit<DraftOptions, "replaceDraftId">): Promise<Buffer> {
   const transporter = nodemailer.createTransport({ streamTransport: true, buffer: true });
+  const bcc = resolveBcc(creds.email, opts.bcc);
   const { message } = await transporter.sendMail({
     from: creds.email,
     to: opts.to?.join(","),
     cc: opts.cc?.join(","),
-    bcc: opts.bcc?.join(","),
+    bcc: bcc?.join(","),
     subject: opts.subject,
     text: opts.text,
     html: opts.html,
@@ -1010,7 +1036,11 @@ export default function (pi: ExtensionAPI) {
       subject: Type.String({ description: "Subject line" }),
       body: Type.String({ description: "Email body (plain text, or HTML when html=true)" }),
       cc: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Cc recipient(s)" })),
-      bcc: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Bcc recipient(s)" })),
+      bcc: Type.Optional(
+        Type.Union([Type.String(), Type.Array(Type.String())], {
+          description: "Bcc recipient(s) — the configured default Bcc (settings.bcc) is always appended",
+        }),
+      ),
       html: Type.Optional(Type.Boolean({ description: "Treat body as HTML (default false)" })),
       account: accountParam,
     }),
@@ -1120,7 +1150,11 @@ export default function (pi: ExtensionAPI) {
       subject: Type.String({ description: "Subject line" }),
       body: Type.String({ description: "Draft body (plain text, or HTML when html=true)" }),
       cc: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Cc recipient(s)" })),
-      bcc: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())], { description: "Bcc recipient(s)" })),
+      bcc: Type.Optional(
+        Type.Union([Type.String(), Type.Array(Type.String())], {
+          description: "Bcc recipient(s) — the configured default Bcc (settings.bcc) is always appended",
+        }),
+      ),
       html: Type.Optional(Type.Boolean({ description: "Treat body as HTML (default false)" })),
       replaceDraftId: Type.Optional(
         Type.String({ description: "Uid of an existing draft to delete first (from gmail_list folder=drafts)" }),
@@ -1391,14 +1425,17 @@ export default function (pi: ExtensionAPI) {
 
   // ---- /gmail-config ----------------------------------------------------------
   pi.registerCommand("gmail-config", {
-    description: "Show Gmail settings (allowSend, confirmSends) and toggle them (persisted to config.json, mode 0600)",
+    description:
+      "Show Gmail settings (allowSend, confirmSends, bcc) and change them (persisted to config.json, mode 0600)",
     handler: async (_args, ctx) => {
       const settings = getSettings();
       const accounts = Object.entries(readNormalized()?.accounts ?? {}).map(([n, a]) => `${n} (${a.email})`);
+      const bccText = settings.bcc?.length ? settings.bcc.join(", ") : "(none)";
       const summary =
         `Accounts: ${accounts.length ? accounts.join(", ") : "(none configured)"}\n` +
         `allowSend: ${settings.allowSend} — ${settings.allowSend ? "gmail_send/gmail_reply send emails" : "DRAFT-ONLY: gmail_send/gmail_reply save drafts, never send"}\n` +
-        `confirmSends: ${settings.confirmSends} — ${settings.confirmSends ? "asks for confirmation before each send" : "sends without confirmation (when allowSend is true)"}`;
+        `confirmSends: ${settings.confirmSends} — ${settings.confirmSends ? "asks for confirmation before each send" : "sends without confirmation (when allowSend is true)"}\n` +
+        `bcc: ${bccText} — always appended to Bcc ("self" = the sending account's own address)`;
 
       if (!ctx.hasUI) {
         ctx.ui.notify(summary, "info");
@@ -1411,6 +1448,9 @@ export default function (pi: ExtensionAPI) {
         settings.confirmSends
           ? "Disable send confirmation (confirmSends → false)"
           : "Enable send confirmation (confirmSends → true)",
+        settings.bcc?.length
+          ? `Clear default Bcc (bcc → none, currently ${settings.bcc.join(", ")})`
+          : 'Set default Bcc to self (bcc → ["self"])',
         "Done (no changes)",
       ]);
       if (!choice || choice.startsWith("Done")) return;
@@ -1437,6 +1477,12 @@ export default function (pi: ExtensionAPI) {
           "confirmSends = true. Each send asks for interactive confirmation; headless runs fall back to drafting.",
           "info",
         );
+      } else if (choice.startsWith("Clear default Bcc")) {
+        next.bcc = undefined;
+        ctx.ui.notify("bcc = none. The default Bcc is no longer appended.", "info");
+      } else if (choice.startsWith("Set default Bcc")) {
+        next.bcc = ["self"];
+        ctx.ui.notify('bcc = ["self"]. The sending account\'s own address is now always appended to Bcc.', "info");
       } else {
         ctx.ui.notify(`Unknown choice: ${choice}`, "warning");
         return;

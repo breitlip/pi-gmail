@@ -262,6 +262,69 @@ test("allowSend=true, confirmSends=false → send without confirmation", async (
 });
 
 // ---------------------------------------------------------------------------
+// 3b. settings.bcc: default Bcc always appended (draft path)
+// ---------------------------------------------------------------------------
+
+test('settings.bcc=["self"]: draft Bcc is the sender\'s own address', async () => {
+  writeConfig({ allowSend: false, confirmSends: true, bcc: ["self"] });
+  const tool = getTool(mock, "gmail_send");
+  const { ctx } = makeCtx({ hasUI: true, confirmAnswer: true });
+  const res = (await tool.execute(
+    "call-bcc-1",
+    { to: "alice@example.com", subject: "Self bcc", body: "Body" },
+    undefined,
+    undefined,
+    ctx,
+  )) as { content: Array<{ text: string }>; isError?: boolean };
+
+  assert.equal(res.isError, undefined, `expected success, got: ${resultText(res)}`);
+  const draft = lastAppend();
+  assert.match(draft.mime, /Bcc:.*test@example\.com/i, "sender's own address must be in Bcc");
+  assert.match(draft.mime, /To:.*alice@example\.com/i);
+});
+
+test("settings.bcc merges with explicit bcc and dedupes case-insensitively", async () => {
+  writeConfig({ allowSend: false, confirmSends: true, bcc: ["Self", "extra@example.com"] });
+  const tool = getTool(mock, "gmail_send");
+  const { ctx } = makeCtx({ hasUI: true, confirmAnswer: true });
+  const res = (await tool.execute(
+    "call-bcc-2",
+    { to: "alice@example.com", subject: "Merge bcc", body: "Body", bcc: "TEST@example.com" },
+    undefined,
+    undefined,
+    ctx,
+  )) as { content: Array<{ text: string }>; isError?: boolean };
+
+  assert.equal(res.isError, undefined, `expected success, got: ${resultText(res)}`);
+  const draft = lastAppend();
+  // Explicit bcc kept first, "self" deduped against it, extra appended.
+  assert.match(draft.mime, /Bcc:.*TEST@example\.com.*extra@example\.com/i);
+  const bccLine = draft.mime.split("\r\n").find((l) => /^Bcc:/i.test(l)) ?? "";
+  assert.equal(
+    (bccLine.match(/TEST@example\.com/gi) ?? []).length,
+    1,
+    "sender address must appear exactly once in Bcc",
+  );
+});
+
+test("no settings.bcc: behavior unchanged (no Bcc header)", async () => {
+  writeConfig({ allowSend: false, confirmSends: true });
+  const tool = getTool(mock, "gmail_send");
+  const { ctx } = makeCtx({ hasUI: true, confirmAnswer: true });
+  const res = (await tool.execute(
+    "call-bcc-3",
+    { to: "alice@example.com", subject: "No bcc", body: "Body" },
+    undefined,
+    undefined,
+    ctx,
+  )) as { content: Array<{ text: string }>; isError?: boolean };
+
+  assert.equal(res.isError, undefined, `expected success, got: ${resultText(res)}`);
+  const draft = lastAppend();
+  assert.doesNotMatch(draft.mime, /Bcc:/i, "no Bcc header expected when unset");
+});
+
+// ---------------------------------------------------------------------------
 // 4. /gmail-config: show + toggle settings, persist at mode 0600
 // ---------------------------------------------------------------------------
 
